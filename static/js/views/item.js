@@ -203,6 +203,7 @@ export async function renderItem(main, ctx) {
         if (empty) empty.remove();
         textarea.value = "";
         item.comments += 1;
+        cacheItem(item);
         updateCommentCounters(main, item.id, item.comments);
         toast("Комментарий опубликован", "success");
       } catch (error) {
@@ -236,6 +237,16 @@ export async function renderItem(main, ctx) {
         confirm.textContent = "Удаляем...";
         try {
           await api.delete(`/api/items/${item.id}`);
+          if (state.stats) {
+            state.stats.items = Math.max(0, (state.stats.items || 0) - 1);
+            if (state.stats.categories) {
+              const category = item.category;
+              state.stats.categories[category] = Math.max(
+                0,
+                (state.stats.categories[category] || 0) - 1
+              );
+            }
+          }
           closeModal();
           toast("Работа удалена", "success");
           navigate("/catalog");

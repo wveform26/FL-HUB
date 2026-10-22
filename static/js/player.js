@@ -368,6 +368,9 @@ export function previous() {
 export function toggle() {
   if (!audio || !current) return;
   if (audio.paused) {
+    if (audio.ended || (Number.isFinite(audio.duration) && audio.currentTime >= audio.duration)) {
+      audio.currentTime = 0;
+    }
     audio.play().catch(() => toast("Не удалось запустить воспроизведение", "error"));
   } else {
     audio.pause();

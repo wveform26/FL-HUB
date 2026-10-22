@@ -270,6 +270,13 @@ export function renderUpload(main) {
       progressBar.style.width = "100%";
       progressValue.textContent = "100%";
       cacheItem(data.item);
+      if (state.stats) {
+        state.stats.items = (state.stats.items || 0) + 1;
+        if (state.stats.categories) {
+          const category = data.item.category;
+          state.stats.categories[category] = (state.stats.categories[category] || 0) + 1;
+        }
+      }
       toast("Работа опубликована", "success");
       navigate(`/item/${data.item.id}`);
     } catch (error) {

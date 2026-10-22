@@ -126,7 +126,7 @@ function renderHeader(path = "/", params = new URLSearchParams()) {
         ` : `
           <a class="btn btn-ghost btn-sm" href="#/login">Войти</a>
         `}
-        <button class="icon-btn menu-toggle" type="button" data-menu-toggle aria-label="Открыть меню">${icon("menu")}</button>
+        <button class="icon-btn menu-toggle" type="button" data-menu-toggle aria-label="Открыть меню" aria-expanded="false">${icon("menu")}</button>
       </div>
     </div>
     <div class="mobile-nav container" id="mobile-nav">
@@ -182,7 +182,7 @@ function renderFooter() {
       </div>
       <div class="footer-bottom">
         <span>© ${year} FL HUB. Сделано для продюсеров.</span>
-        <span>Демо-версия · Python + SQLite · без внешних зависимостей</span>
+        <span>Python + SQLite · без внешних зависимостей</span>
       </div>
     </div>
   `;
@@ -236,6 +236,12 @@ function closeUserDropdown() {
 
 function closeMobileMenu() {
   document.getElementById("mobile-nav")?.classList.remove("is-open");
+  document.querySelector("[data-menu-toggle]")?.setAttribute("aria-expanded", "false");
+}
+
+function closePlayerQueue() {
+  document.getElementById("player-queue")?.classList.remove("is-open");
+  document.querySelector("[data-queue-toggle]")?.setAttribute("aria-expanded", "false");
 }
 
 async function handleLike(itemId) {
@@ -350,8 +356,11 @@ function setupEvents() {
       closeUserDropdown();
     }
 
-    if (event.target.closest("[data-menu-toggle]")) {
-      document.getElementById("mobile-nav")?.classList.toggle("is-open");
+    const menuToggle = event.target.closest("[data-menu-toggle]");
+    if (menuToggle) {
+      const nav = document.getElementById("mobile-nav");
+      const open = Boolean(nav?.classList.toggle("is-open"));
+      menuToggle.setAttribute("aria-expanded", open ? "true" : "false");
       return;
     }
 
@@ -368,6 +377,18 @@ function setupEvents() {
     if (event.target.closest("#mobile-nav a")) {
       closeMobileMenu();
     }
+
+    if (!event.target.closest("#player-queue") && !event.target.closest("[data-queue-toggle]")) {
+      closePlayerQueue();
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    closeModal();
+    closeUserDropdown();
+    closeMobileMenu();
+    closePlayerQueue();
   });
 
   header?.addEventListener("submit", (event) => {
@@ -413,12 +434,17 @@ async function init() {
   renderHeader();
   setupEvents();
 
-  try {
-    const [me, stats] = await Promise.all([api.get("/api/me"), api.get("/api/stats")]);
-    state.user = me.user;
-    state.stats = stats;
-  } catch (error) {
-    console.warn("Не удалось загрузить состояние:", error);
+  const [meResult, statsResult] = await Promise.allSettled([
+    api.get("/api/me"),
+    api.get("/api/stats"),
+  ]);
+  if (meResult.status === "fulfilled") state.user = meResult.value.user;
+  if (statsResult.status === "fulfilled") state.stats = statsResult.value;
+  if (meResult.status === "rejected" || statsResult.status === "rejected") {
+    console.warn(
+      "Не удалось загрузить состояние:",
+      meResult.status === "rejected" ? meResult.reason : statsResult.reason
+    );
   }
 
   if (!window.location.hash) {

@@ -50,7 +50,6 @@ export function renderAuth(main, ctx) {
           <h2 class="auth-title">${isRegister ? "Создать аккаунт" : "С возвращением"}</h2>
           <p class="auth-sub">${isRegister ? "Пара шагов — и ты в сообществе." : "Войди, чтобы слушать, скачивать и публиковать."}</p>
           ${form}
-          ${!isRegister ? `<div class="demo-hint">Демо-доступ: <code>nightdrive</code> / <code>flhub1234</code></div>` : ""}
           <div class="auth-alt">
             ${isRegister
               ? `Уже есть аккаунт? <a href="#/login?next=${encodeURIComponent(next)}">Войти</a>`
@@ -119,7 +118,7 @@ function loginForm() {
       <div class="field">
         <label class="label" for="login-identifier">Имя или email</label>
         <input class="input" id="login-identifier" name="identifier" type="text" autocomplete="username"
-               placeholder="nightdrive" required>
+               placeholder="beatmaker" required>
       </div>
       <div class="field">
         <label class="label" for="login-password">Пароль</label>

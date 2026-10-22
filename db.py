@@ -1,12 +1,15 @@
 """SQLite storage for FL HUB."""
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(
+    os.environ.get("FLHUB_DATA_DIR", str(BASE_DIR / "data"))
+).expanduser()
 DB_PATH = DATA_DIR / "flhub.db"
 UPLOAD_DIR = DATA_DIR / "uploads"
 COVER_DIR = DATA_DIR / "covers"

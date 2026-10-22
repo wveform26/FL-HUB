@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import secrets
 import wave
 import zipfile
 from array import array
@@ -14,7 +15,10 @@ import db
 import security
 import synth
 
-DEMO_PASSWORD = "flhub1234"
+
+def _demo_password_hash() -> str:
+    """Пароль демо-аккаунта случаен: войти под ним нельзя."""
+    return security.hash_password(secrets.token_urlsafe(18))
 
 
 def _iso(days_ago: float) -> str:
@@ -419,17 +423,17 @@ def seed(force: bool = False) -> None:
             )
             conn.commit()
             for folder in (db.UPLOAD_DIR, db.COVER_DIR):
-                for path in folder.glob("seed_*"):
-                    path.unlink(missing_ok=True)
+                for path in folder.iterdir():
+                    if path.is_file():
+                        path.unlink(missing_ok=True)
 
         print("FL HUB: создаю демо-пользователей...")
-        password_hash = security.hash_password(DEMO_PASSWORD)
         user_ids: dict[str, int] = {}
         for user in USERS:
             cursor = conn.execute(
                 "INSERT INTO users (username, email, password_hash, bio, avatar_color, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (user["username"], user["email"], password_hash, user["bio"],
+                (user["username"], user["email"], _demo_password_hash(), user["bio"],
                  user["avatar_color"], _iso(user["days"])),
             )
             user_ids[user["username"]] = cursor.lastrowid
@@ -517,7 +521,28 @@ def seed(force: bool = False) -> None:
             )
         conn.commit()
         print(f"FL HUB: готово — {len(USERS)} пользователей, {len(ITEMS)} работ.")
-        print(f"FL HUB: демо-вход — nightdrive / {DEMO_PASSWORD}")
+        print("FL HUB: у демо-аккаунтов случайные пароли, для входа зарегистрируйте свой.")
+    finally:
+        conn.close()
+
+
+def lock_demo_accounts() -> int:
+    """Сбрасывает пароли демо-аккаунтов, созданных старой версией seed.py."""
+    db.init_db()
+    conn = db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT id FROM users WHERE email LIKE '%@flhub.local' COLLATE NOCASE"
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (_demo_password_hash(), row["id"]),
+            )
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+        conn.commit()
+        print(f"FL HUB: пароли демо-аккаунтов обновлены ({len(rows)}).")
+        return len(rows)
     finally:
         conn.close()
 

@@ -6,12 +6,15 @@ Run: python3 server.py
 """
 from __future__ import annotations
 
+
 import argparse
 import json
 import mimetypes
 import os
 import re
 import secrets
+import threading
+import time
 import traceback
 import wave
 from datetime import datetime, timedelta, timezone
@@ -32,6 +35,16 @@ SESSION_DAYS = 30
 MAX_JSON_BODY = 1_000_000
 MAX_UPLOAD_BODY = 180 * 1024 * 1024
 PAGE_SIZE = 24
+
+# Попытки входа и регистрации ограничены по IP, чтобы не подбирали пароли.
+LOGIN_RATE_LIMIT = (10, 5 * 60)
+REGISTER_RATE_LIMIT = (5, 60 * 60)
+RATE_LIMIT_LOCK = threading.Lock()
+RATE_LIMIT_BUCKETS: dict[str, list[float]] = {}
+
+# Хеш-заглушка: вход с несуществующим именем занимает столько же времени,
+# сколько и вход с неверным паролем.
+DUMMY_PASSWORD_HASH = security.hash_password(secrets.token_urlsafe(18))
 
 CATEGORIES = {"music", "project", "instrument", "plugin", "drumkit"}
 SORTS = {"new", "popular", "downloads"}
@@ -199,10 +212,54 @@ def parse_multipart(body: bytes, boundary: bytes) -> tuple[dict[str, str], dict[
 class Handler(BaseHTTPRequestHandler):
     server_version = "FLHub/1.0"
     protocol_version = "HTTP/1.1"
+    secure_cookies = False
+    trust_proxy = False
 
     # -- infrastructure ---------------------------------------------------
     def log_message(self, fmt: str, *args) -> None:
         print(f"[{self.log_date_time_string()}] {fmt % args}")
+
+    def client_ip(self) -> str:
+        if self.trust_proxy:
+            forwarded = self.headers.get("X-Forwarded-For", "")
+            addresses = [part.strip() for part in forwarded.split(",") if part.strip()]
+            if addresses:
+                return addresses[0]
+        return self.client_address[0]
+
+    def cookie_is_secure(self) -> bool:
+        if self.secure_cookies:
+            return True
+        if not self.trust_proxy:
+            return False
+        proto = self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower()
+        return proto == "https"
+
+    @staticmethod
+    def check_rate_limit(key: str, limit: int, window: int) -> None:
+        now = time.monotonic()
+        with RATE_LIMIT_LOCK:
+            if len(RATE_LIMIT_BUCKETS) > 5000:
+                stale = [
+                    bucket_key
+                    for bucket_key, stamps in RATE_LIMIT_BUCKETS.items()
+                    if not stamps or now - stamps[-1] > 3600
+                ]
+                for bucket_key in stale:
+                    RATE_LIMIT_BUCKETS.pop(bucket_key, None)
+            bucket = [
+                stamp for stamp in RATE_LIMIT_BUCKETS.get(key, []) if now - stamp < window
+            ]
+            if len(bucket) >= limit:
+                RATE_LIMIT_BUCKETS[key] = bucket
+                raise ApiError(429, "Слишком много попыток. Попробуйте позже.")
+            bucket.append(now)
+            RATE_LIMIT_BUCKETS[key] = bucket
+
+    @staticmethod
+    def reset_rate_limit(key: str) -> None:
+        with RATE_LIMIT_LOCK:
+            RATE_LIMIT_BUCKETS.pop(key, None)
 
     def do_GET(self) -> None:
         self.dispatch("GET")
@@ -223,10 +280,24 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path.startswith("/api/"):
                 if method in {"POST", "PATCH", "DELETE"}:
-                    length = int(self.headers.get("Content-Length") or 0)
-                    if length > MAX_UPLOAD_BODY:
+                    try:
+                        length = int(self.headers.get("Content-Length") or 0)
+                    except ValueError:
                         self.close_connection = True
-                        raise ApiError(413, "Файл слишком большой (максимум 180 МБ)")
+                        raise ApiError(400, "Некорректная длина запроса")
+                    if length < 0:
+                        self.close_connection = True
+                        raise ApiError(400, "Некорректная длина запроса")
+                    is_upload = method == "POST" and path == "/api/items"
+                    limit = MAX_UPLOAD_BODY if is_upload else MAX_JSON_BODY
+                    if length > limit:
+                        self.close_connection = True
+                        message = (
+                            "Файл слишком большой (максимум 180 МБ)"
+                            if is_upload
+                            else "Слишком большой запрос"
+                        )
+                        raise ApiError(413, message)
                     self._body = self.rfile.read(length) if length else b""
                 self.check_csrf(method)
                 self.handle_api(method, path, parse_qs(parsed.query))
@@ -322,16 +393,16 @@ class Handler(BaseHTTPRequestHandler):
         )
         return token
 
-    @staticmethod
-    def session_cookie(token: str) -> str:
+    def session_cookie(self, token: str) -> str:
+        secure = "; Secure" if self.cookie_is_secure() else ""
         return (
             f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; "
-            f"Max-Age={SESSION_DAYS * 86400}"
+            f"Max-Age={SESSION_DAYS * 86400}{secure}"
         )
 
-    @staticmethod
-    def clear_cookie() -> str:
-        return f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+    def clear_cookie(self) -> str:
+        secure = "; Secure" if self.cookie_is_secure() else ""
+        return f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}"
 
     # -- API --------------------------------------------------------------
     def handle_api(self, method: str, path: str, query: dict) -> None:
@@ -439,7 +510,11 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def handle_authors(self, conn, query: dict) -> None:
-        limit = max(1, min(12, int(query.get("limit", ["4"])[0] or 4)))
+        try:
+            limit = int(query.get("limit", ["4"])[0] or 4)
+        except ValueError:
+            raise ApiError(400, "Некорректный лимит")
+        limit = max(1, min(12, limit))
         rows = conn.execute(
             "SELECT u.id, u.username, u.bio, u.avatar_color, u.created_at, "
             "COUNT(i.id) AS item_count, COALESCE(SUM(i.downloads), 0) AS downloads, "
@@ -589,6 +664,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- auth -------------------------------------------------------------
     def handle_register(self, conn) -> None:
+        rate_key = f"register:{self.client_ip()}"
+        self.check_rate_limit(rate_key, *REGISTER_RATE_LIMIT)
         data = self.read_json()
         username = clean_text(str(data.get("username", "")), 24)
         email = clean_text(str(data.get("email", "")), 120).lower()
@@ -597,6 +674,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Имя: 3–24 символа, латиница, цифры и _")
         if not EMAIL_RE.match(email):
             raise ApiError(400, "Введите корректный email")
+        if email.endswith("@flhub.local"):
+            raise ApiError(400, "Этот домен email зарезервирован")
         if len(password) < 8 or len(password) > 128:
             raise ApiError(400, "Пароль должен быть от 8 до 128 символов")
         existing = conn.execute(
@@ -613,22 +692,30 @@ class Handler(BaseHTTPRequestHandler):
         )
         token = self.create_session(conn, cursor.lastrowid)
         conn.commit()
+        self.reset_rate_limit(rate_key)
         row = conn.execute("SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)).fetchone()
         self.send_json(
             {"user": public_user(row)}, 201, self.session_cookie(token)
         )
 
     def handle_login(self, conn) -> None:
+        rate_key = f"login:{self.client_ip()}"
+        self.check_rate_limit(rate_key, *LOGIN_RATE_LIMIT)
         data = self.read_json()
         identifier = clean_text(str(data.get("identifier", "")), 120)
         password = str(data.get("password", ""))
         if not identifier or not password:
             raise ApiError(400, "Заполните все поля")
+        if len(password) > 128:
+            raise ApiError(401, "Неверное имя или пароль")
         row = conn.execute(
             "SELECT * FROM users WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE",
             (identifier, identifier),
         ).fetchone()
-        if not row or not security.verify_password(password, row["password_hash"]):
+        if not row:
+            security.verify_password(password, DUMMY_PASSWORD_HASH)
+            raise ApiError(401, "Неверное имя или пароль")
+        if not security.verify_password(password, row["password_hash"]):
             raise ApiError(401, "Неверное имя или пароль")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=SESSION_DAYS)).replace(
             microsecond=0
@@ -636,6 +723,7 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("DELETE FROM sessions WHERE created_at < ?", (cutoff,))
         token = self.create_session(conn, row["id"])
         conn.commit()
+        self.reset_rate_limit(rate_key)
         self.send_json({"user": public_user(row)}, 200, self.session_cookie(token))
 
     def handle_logout(self, conn, user) -> None:
@@ -910,9 +998,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             raw_start, raw_end = match.groups()
-            if raw_start:
+            if not raw_start and not raw_end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if not raw_start:
+                suffix = int(raw_end)
+                if suffix <= 0:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                start = max(0, size - suffix)
+            elif raw_start:
                 start = int(raw_start)
-            if raw_end:
+            if raw_start and raw_end:
                 end = min(int(raw_end), size - 1)
             if start >= size or start > end:
                 self.send_response(416)
@@ -949,14 +1052,50 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="FL HUB demo server")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--reseed", action="store_true", help="пересоздать демо-контент")
+    parser = argparse.ArgumentParser(description="FL HUB server")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("PORT", "8000")),
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="создать демо-контент, если база пуста",
+    )
+    parser.add_argument(
+        "--reseed",
+        action="store_true",
+        help="удалить все данные и пересоздать демо-контент",
+    )
+    parser.add_argument(
+        "--lock-demo-accounts",
+        action="store_true",
+        help="заменить пароли демо-аккаунтов на случайные и выйти",
+    )
+    parser.add_argument(
+        "--secure-cookies",
+        action="store_true",
+        help="ставить флаг Secure у cookie сессии (нужен HTTPS)",
+    )
+    parser.add_argument(
+        "--trust-proxy",
+        action="store_true",
+        help="доверять X-Forwarded-For и X-Forwarded-Proto от reverse proxy",
+    )
     args = parser.parse_args()
 
+    Handler.secure_cookies = args.secure_cookies
+    Handler.trust_proxy = args.trust_proxy
+
     db.init_db()
-    seed.seed(force=args.reseed)
+    if args.demo or args.reseed:
+        seed.seed(force=args.reseed)
+    if args.lock_demo_accounts:
+        seed.lock_demo_accounts()
+        print("FL HUB: готово. Запустите сервер без --lock-demo-accounts.")
+        return
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
@@ -969,7 +1108,8 @@ def main() -> None:
     print("  ╚═╝     ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ")
     print()
     print(f"  FL HUB запущен: http://{args.host}:{args.port}")
-    print(f"  Демо-вход: nightdrive / {seed.DEMO_PASSWORD}")
+    if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.secure_cookies:
+        print("  Для HTTPS-размещения включите --secure-cookies.")
     print("  Ctrl+C — остановить сервер")
     print()
     try:

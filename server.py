@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """FL HUB — a tiny community site for FL Studio musicians.
 
-Pure standard library: HTTP server, SQLite, session auth, multipart uploads.
+HTTP server (stdlib), PostgreSQL (psycopg2), session auth, multipart uploads.
 Run: python3 server.py
 """
 from __future__ import annotations
@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 import art
 import db
+import mailer
 import seed
 import security
 
@@ -39,8 +40,15 @@ PAGE_SIZE = 24
 # Попытки входа и регистрации ограничены по IP, чтобы не подбирали пароли.
 LOGIN_RATE_LIMIT = (10, 5 * 60)
 REGISTER_RATE_LIMIT = (5, 60 * 60)
+VERIFY_RATE_LIMIT = (12, 10 * 60)
+RESEND_RATE_LIMIT = (6, 30 * 60)
 RATE_LIMIT_LOCK = threading.Lock()
 RATE_LIMIT_BUCKETS: dict[str, list[float]] = {}
+
+# Подтверждение email: шестизначный код, живёт 15 минут, 5 попыток ввода.
+EMAIL_CODE_TTL_MINUTES = 15
+EMAIL_CODE_MAX_ATTEMPTS = 5
+EMAIL_RESEND_COOLDOWN = 60  # секунд между отправками одного кода
 
 # Хеш-заглушка: вход с несуществующим именем занимает столько же времени,
 # сколько и вход с неверным паролем.
@@ -48,6 +56,7 @@ DUMMY_PASSWORD_HASH = security.hash_password(secrets.token_urlsafe(18))
 
 CATEGORIES = {"music", "project", "instrument", "plugin", "drumkit"}
 SORTS = {"new", "popular", "downloads"}
+ACCESS_TYPES = {"free", "paid"}
 
 AUDIO_EXT = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
 ARCHIVE_EXT = {".zip", ".rar", ".7z"}
@@ -73,10 +82,11 @@ RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, extra: dict | None = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.extra = extra or {}
 
 
 def now_iso() -> str:
@@ -89,6 +99,7 @@ def public_user(row) -> dict:
         "username": row["username"],
         "bio": row["bio"],
         "avatar_color": row["avatar_color"],
+        "email_verified": bool(row["email_verified"]),
         "created_at": row["created_at"],
     }
 
@@ -103,7 +114,48 @@ def media_url(folder: str, filename: str) -> str:
     return f"/media/{folder}/{quote(filename)}"
 
 
+# -- email verification ----------------------------------------------------
+def new_email_code() -> str:
+    """Ровно 6 цифр: 100000..999999."""
+    return str(secrets.randbelow(900_000) + 100_000)
+
+
+def mask_email(email: str) -> str:
+    """ma***@example.com — чтобы показывать адрес, не светя его целиком."""
+    name, _, domain = (email or "").partition("@")
+    if not domain:
+        return "***"
+    visible = name[:2] if len(name) > 2 else name[:1]
+    return f"{visible}{'*' * max(3, len(name) - len(visible))}@{domain}"
+
+
+def issue_email_code(conn, user_row) -> None:
+    """Генерирует код, отправляет письмо и сохраняет только его хеш."""
+    code = new_email_code()
+    body = mailer.verification_text(user_row["username"], code, EMAIL_CODE_TTL_MINUTES)
+    try:
+        mailer.send_email(user_row["email"], "FL HUB — код подтверждения аккаунта", body)
+    except mailer.MailError as error:
+        raise ApiError(502, f"Почта недоступна: {error}")
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(minutes=EMAIL_CODE_TTL_MINUTES)
+    ).replace(microsecond=0).isoformat()
+    conn.execute("DELETE FROM email_codes WHERE user_id = ?", (user_row["id"],))
+    conn.execute(
+        "INSERT INTO email_codes (user_id, code_hash, expires_at, attempts, created_at) "
+        "VALUES (?, ?, ?, 0, ?)",
+        (user_row["id"], security.hash_password(code), expires_at, now_iso()),
+    )
+
+
 def item_dict(row, liked: bool = False, viewer_id: int | None = None) -> dict:
+    is_paid = row["access"] == "paid"
+    is_owner = bool(viewer_id and viewer_id == row["author_id"])
+    audio_url = ""
+    if is_paid and not is_owner and row["demo_path"]:
+        audio_url = media_url("demos", row["demo_path"])
+    elif row["audio_path"]:
+        audio_url = media_url("uploads", row["audio_path"])
     return {
         "id": row["id"],
         "category": row["category"],
@@ -114,8 +166,9 @@ def item_dict(row, liked: bool = False, viewer_id: int | None = None) -> dict:
         "key": row["music_key"],
         "tags": [tag for tag in (row["tags"] or "").split(",") if tag],
         "cover_url": media_url("covers", row["cover_path"]),
-        "audio_url": media_url("uploads", row["audio_path"]),
+        "audio_url": audio_url,
         "file_url": f"/download/{row['id']}",
+        "demo_url": media_url("demos", row["demo_path"]) if row["demo_path"] else "",
         "file_name": row["file_name"],
         "file_size": row["file_size"],
         "duration": row["duration"],
@@ -125,7 +178,8 @@ def item_dict(row, liked: bool = False, viewer_id: int | None = None) -> dict:
         "comments": row["comments_count"],
         "featured": bool(row["featured"]),
         "liked": bool(liked),
-        "is_owner": bool(viewer_id and viewer_id == row["author_id"]),
+        "is_owner": is_owner,
+        "access": row["access"],
         "created_at": row["created_at"],
         "author": {
             "id": row["author_id"],
@@ -309,7 +363,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_static(path)
         except ApiError as error:
             if path.startswith("/api/"):
-                self.send_json({"error": error.message}, error.status)
+                payload = {"error": error.message}
+                payload.update(error.extra)
+                self.send_json(payload, error.status)
             else:
                 self.send_text(error.message, error.status)
         except (BrokenPipeError, ConnectionResetError):
@@ -449,6 +505,12 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/login":
                     self.handle_login(conn)
                     return
+                if path == "/api/verify-email":
+                    self.handle_verify_email(conn)
+                    return
+                if path == "/api/resend-code":
+                    self.handle_resend_code(conn)
+                    return
                 if path == "/api/logout":
                     self.handle_logout(conn, user)
                     return
@@ -551,7 +613,7 @@ class Handler(BaseHTTPRequestHandler):
             where.append("i.genre = ?")
             params.append(genre)
         if author:
-            where.append("u.username = ? COLLATE NOCASE")
+            where.append("LOWER(u.username) = LOWER(?)")
             params.append(author)
         if featured in {"1", "true"}:
             where.append("i.featured = 1")
@@ -565,7 +627,10 @@ class Handler(BaseHTTPRequestHandler):
 
         order = {
             "new": "i.created_at DESC",
-            "popular": "(likes_count * 4 + i.downloads * 2 + i.plays * 0.25) DESC, i.created_at DESC",
+            "popular": (
+                "((SELECT COUNT(*) FROM likes l WHERE l.item_id = i.id) * 4 "
+                "+ i.downloads * 2 + i.plays * 0.25) DESC, i.created_at DESC"
+            ),
             "downloads": "i.downloads DESC, i.created_at DESC",
         }[sort]
 
@@ -635,7 +700,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_profile(self, conn, username: str, viewer_id: int | None) -> None:
         row = conn.execute(
-            "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+            "SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username,)
         ).fetchone()
         if not row:
             raise ApiError(404, "Пользователь не найден")
@@ -679,24 +744,32 @@ class Handler(BaseHTTPRequestHandler):
         if len(password) < 8 or len(password) > 128:
             raise ApiError(400, "Пароль должен быть от 8 до 128 символов")
         existing = conn.execute(
-            "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE",
+            "SELECT 1 FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)",
             (username, email),
         ).fetchone()
         if existing:
             raise ApiError(409, "Такое имя или email уже заняты")
         color = AVATAR_COLORS[sum(username.lower().encode()) % len(AVATAR_COLORS)]
         cursor = conn.execute(
-            "INSERT INTO users (username, email, password_hash, bio, avatar_color, created_at) "
-            "VALUES (?, ?, ?, '', ?, ?)",
+            "INSERT INTO users (username, email, password_hash, bio, avatar_color, email_verified, created_at) "
+            "VALUES (?, ?, ?, '', ?, FALSE, ?)",
             (username, email, security.hash_password(password), color, now_iso()),
         )
-        token = self.create_session(conn, cursor.lastrowid)
+        user_row = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        try:
+            issue_email_code(conn, user_row)
+        except ApiError:
+            conn.execute("DELETE FROM users WHERE id = ?", (user_row["id"],))
+            raise
         conn.commit()
         self.reset_rate_limit(rate_key)
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)).fetchone()
-        self.send_json(
-            {"user": public_user(row)}, 201, self.session_cookie(token)
-        )
+        self.send_json({
+            "verification_required": True,
+            "email": mask_email(email),
+            "expires_in": EMAIL_CODE_TTL_MINUTES * 60,
+        }, 201)
 
     def handle_login(self, conn) -> None:
         rate_key = f"login:{self.client_ip()}"
@@ -709,7 +782,7 @@ class Handler(BaseHTTPRequestHandler):
         if len(password) > 128:
             raise ApiError(401, "Неверное имя или пароль")
         row = conn.execute(
-            "SELECT * FROM users WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE",
+            "SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)",
             (identifier, identifier),
         ).fetchone()
         if not row:
@@ -717,6 +790,12 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(401, "Неверное имя или пароль")
         if not security.verify_password(password, row["password_hash"]):
             raise ApiError(401, "Неверное имя или пароль")
+        if not row["email_verified"]:
+            raise ApiError(
+                403,
+                "Подтвердите email — мы отправили код. Он может придти не сразу.",
+                {"verification_required": True, "email": mask_email(row["email"])},
+            )
         cutoff = (datetime.now(timezone.utc) - timedelta(days=SESSION_DAYS)).replace(
             microsecond=0
         ).isoformat()
@@ -739,6 +818,93 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         self.send_json({"ok": True}, 200, self.clear_cookie())
+
+    # -- email verification ------------------------------------------------
+    def handle_verify_email(self, conn) -> None:
+        rate_key = f"verify:{self.client_ip()}"
+        self.check_rate_limit(rate_key, *VERIFY_RATE_LIMIT)
+        data = self.read_json()
+        email = clean_text(str(data.get("email", "")), 120).lower()
+        code = clean_text(str(data.get("code", "")), 10)
+        if not EMAIL_RE.match(email):
+            raise ApiError(400, "Введите корректный email")
+        if not code.isdigit() or len(code) != 6:
+            raise ApiError(400, "Код — 6 цифр")
+        row = conn.execute(
+            "SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (email,)
+        ).fetchone()
+        if not row:
+            raise ApiError(400, "Аккаунт с таким email не найден")
+        if row["email_verified"]:
+            raise ApiError(
+                400, "Этот аккаунт уже подтверждён — просто войди",
+                {"already_verified": True},
+            )
+        codes = conn.execute(
+            "SELECT * FROM email_codes WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchall()
+        if not codes:
+            issue_email_code(conn, row)
+            raise ApiError(
+                408, "Код не был отправлен. Мы отправили новый — проверь почту.",
+                {"code_sent": True},
+            )
+        record = codes[0]
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        if record["expires_at"] <= now.isoformat():
+            raise ApiError(
+                410,
+                "Срок действия кода истёк. Запроси новый.",
+                {"code_expired": True},
+            )
+        if record["attempts"] >= EMAIL_CODE_MAX_ATTEMPTS:
+            raise ApiError(
+                429,
+                "Слишком много неверных попыток. Запроси новый код.",
+                {"code_expired": True},
+            )
+        if not security.verify_password(code, record["code_hash"]):
+            conn.execute("UPDATE email_codes SET attempts = attempts + 1 WHERE id = ?", (record["id"],))
+            left = EMAIL_CODE_MAX_ATTEMPTS - record["attempts"] - 1
+            raise ApiError(400, f"Неверный код. Осталось попыток: {max(left, 0)}")
+        conn.execute("DELETE FROM email_codes WHERE user_id = ?", (row["id"],))
+        conn.execute("UPDATE users SET email_verified = TRUE WHERE id = ?", (row["id"],))
+        conn.commit()
+        self.reset_rate_limit(rate_key)
+        token = self.create_session(conn, row["id"])
+        fresh = conn.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone()
+        self.send_json({"user": public_user(fresh)}, 200, self.session_cookie(token))
+
+    def handle_resend_code(self, conn) -> None:
+        rate_key = f"resend:{self.client_ip()}"
+        self.check_rate_limit(rate_key, *RESEND_RATE_LIMIT)
+        data = self.read_json()
+        email = clean_text(str(data.get("email", "")), 120).lower()
+        row = conn.execute(
+            "SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (email,)
+        ).fetchone()
+        if not row or row["email_verified"]:
+            # не раскрываем наличие аккаунта
+            self.send_json({"ok": True})
+            return
+        latest = conn.execute(
+            "SELECT created_at FROM email_codes WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if latest:
+            since = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(latest["created_at"])
+            ).total_seconds()
+            if since < EMAIL_RESEND_COOLDOWN:
+                raise ApiError(
+                    429,
+                    f"Код уже отправлен. Новый можно запросить через {max(1, int(EMAIL_RESEND_COOLDOWN - since))} с.",
+                )
+        issue_email_code(conn, row)
+        self.send_json(
+            {"ok": True, "email": mask_email(email), "expires_in": EMAIL_CODE_TTL_MINUTES * 60}
+        )
 
     def require_user(self, user):
         if not user:
@@ -773,6 +939,9 @@ class Handler(BaseHTTPRequestHandler):
         category = fields.get("category", "")
         if category not in CATEGORIES:
             raise ApiError(400, "Выберите категорию")
+        access = fields.get("access", "free")
+        if access not in ACCESS_TYPES:
+            raise ApiError(400, "Некорректный тип доступа")
         title = clean_text(fields.get("title", ""), 120)
         description = clean_text(fields.get("description", ""), 4000)
         genre = clean_text(fields.get("genre", ""), 40)
@@ -792,7 +961,7 @@ class Handler(BaseHTTPRequestHandler):
 
         main_file = files.get("file")
         if not main_file or not main_file["data"]:
-            raise ApiError(400, "Прикрепите файл")
+            raise ApiError(400, "Прикрепите файл работы.")
         original_name = clean_text(main_file["filename"], 160) or "file"
         extension = Path(original_name).suffix.lower()
         allowed = CATEGORY_EXT[category]
@@ -801,6 +970,21 @@ class Handler(BaseHTTPRequestHandler):
                 400,
                 "Неподдерживаемый формат файла: " + (extension or "без расширения"),
             )
+
+        # Demo file for paid content
+        demo_file = files.get("demo")
+        if access == "paid" and not (demo_file and demo_file["data"]):
+            raise ApiError(400, "Для платного контента прикрепи демо-версию.")
+        demo_ext = ""
+        demo_name = ""
+        if demo_file and demo_file["data"]:
+            demo_ext = Path(demo_file["filename"]).suffix.lower()
+            demo_allowed = AUDIO_EXT | ARCHIVE_EXT
+            if demo_ext not in demo_allowed:
+                raise ApiError(400, "Демо: поддерживаемые форматы — аудио и архивы")
+            demo_stored = f"demo_{secrets.token_hex(10)}{demo_ext}"
+            (db.UPLOAD_DIR / demo_stored).write_bytes(demo_file["data"])
+            demo_name = demo_stored
 
         cover_file = files.get("cover")
         cover_ext = ""
@@ -840,12 +1024,12 @@ class Handler(BaseHTTPRequestHandler):
         cursor = conn.execute(
             "INSERT INTO items (author_id, category, title, description, genre, bpm, "
             "music_key, tags, cover_path, file_path, file_name, file_size, audio_path, "
-            "duration, plays, downloads, featured, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)",
+            "duration, plays, downloads, featured, access, demo_path, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)",
             (
                 user["id"], category, title, description, genre, bpm, music_key, tags,
                 cover_name, stored_name, original_name, len(main_file["data"]),
-                audio_path, duration, now_iso(),
+                audio_path, duration, access, demo_name, now_iso(),
             ),
         )
         conn.commit()
@@ -861,7 +1045,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(403, "Можно удалять только свои работы")
         conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
         conn.commit()
-        for folder, name in ((db.UPLOAD_DIR, row["file_path"]), (db.COVER_DIR, row["cover_path"])):
+        for folder, name in ((db.UPLOAD_DIR, row["file_path"]), (db.UPLOAD_DIR, row["demo_path"]), (db.COVER_DIR, row["cover_path"])):
             if name:
                 path = folder / name
                 if path.is_file():
@@ -931,7 +1115,7 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) != 4:
             raise ApiError(404, "Файл не найден")
         folder, filename = parts[2], parts[3]
-        if folder not in {"covers", "uploads"} or Path(filename).name != filename:
+        if folder not in {"covers", "uploads", "demos"} or Path(filename).name != filename:
             raise ApiError(404, "Файл не найден")
         directory = db.COVER_DIR if folder == "covers" else db.UPLOAD_DIR
         target = directory / filename
@@ -950,15 +1134,20 @@ class Handler(BaseHTTPRequestHandler):
         conn = db.connect()
         try:
             row = conn.execute(
-                "SELECT file_path, file_name FROM items WHERE id = ?", (item_id,)
+                "SELECT file_path, demo_path, access, author_id, file_name FROM items WHERE id = ?", (item_id,)
             ).fetchone()
-            if not row or not row["file_path"]:
+            if not row:
                 raise ApiError(404, "Файл не найден")
-            target = db.UPLOAD_DIR / row["file_path"]
+            # Paid items: serve demo to non-owners
+            target_path = row["file_path"]
+            if row["access"] == "paid" and row["demo_path"]:
+                target_path = row["demo_path"]
+            target = db.UPLOAD_DIR / target_path
             if not target.is_file():
                 raise ApiError(404, "Файл не найден")
-            conn.execute("UPDATE items SET downloads = downloads + 1 WHERE id = ?", (item_id,))
-            conn.commit()
+            if row["access"] != "paid":
+                conn.execute("UPDATE items SET downloads = downloads + 1 WHERE id = ?", (item_id,))
+                conn.commit()
             self.serve_file(target, "application/octet-stream", download_name=row["file_name"])
         finally:
             conn.close()
@@ -1075,6 +1264,11 @@ def main() -> None:
         help="заменить пароли демо-аккаунтов на случайные и выйти",
     )
     parser.add_argument(
+        "--remove-demo",
+        action="store_true",
+        help="удалить демо-аккаунты с их работами, лайками и комментариями и выйти",
+    )
+    parser.add_argument(
         "--secure-cookies",
         action="store_true",
         help="ставить флаг Secure у cookie сессии (нужен HTTPS)",
@@ -1090,6 +1284,10 @@ def main() -> None:
     Handler.trust_proxy = args.trust_proxy
 
     db.init_db()
+    if args.remove_demo:
+        seed.remove_demo_accounts()
+        print("FL HUB: готово. Запустите сервер без --remove-demo.")
+        return
     if args.demo or args.reseed:
         seed.seed(force=args.reseed)
     if args.lock_demo_accounts:

@@ -3,6 +3,7 @@ import { icon } from "../icons.js";
 import { navigate, setUser } from "../store.js";
 import { toast } from "../ui.js";
 import { escapeAttr, escapeHtml, safeNext } from "../utils.js";
+import { rememberVerification } from "./verify.js";
 
 export function renderAuth(main, ctx) {
   const isRegister = ctx.path === "/register";
@@ -48,7 +49,7 @@ export function renderAuth(main, ctx) {
         <div class="auth-card">
           ${tabs}
           <h2 class="auth-title">${isRegister ? "Создать аккаунт" : "С возвращением"}</h2>
-          <p class="auth-sub">${isRegister ? "Пара шагов — и ты в сообществе." : "Войди, чтобы слушать, скачивать и публиковать."}</p>
+          <p class="auth-sub">${isRegister ? "Заполни форму — и мы пришлём на почту код из 6 цифр." : "Войди, чтобы слушать, скачивать и публиковать."}</p>
           ${form}
           <div class="auth-alt">
             ${isRegister
@@ -98,13 +99,31 @@ export function renderAuth(main, ctx) {
 
     submit.disabled = true;
     const initialLabel = submit.textContent;
-    submit.textContent = isRegister ? "Создаём..." : "Входим...";
+    submit.textContent = isRegister ? "Отправляем код..." : "Входим...";
     try {
       const data = await api.post(isRegister ? "/api/register" : "/api/login", payload);
+      if (data.verification_required) {
+        const hint = data.email || "";
+        rememberVerification({ email: payload.email || "", hint, next });
+        toast(`Мы отправили код подтверждения${hint ? ` на ${hint}` : ""}`, "success");
+        const params = new URLSearchParams({ next });
+        if (payload.email) params.set("email", payload.email);
+        if (hint) params.set("hint", hint);
+        navigate(`/verify?${params.toString()}`);
+        return;
+      }
       setUser(data.user);
       toast(isRegister ? `Добро пожаловать, @${data.user.username}` : `С возвращением, @${data.user.username}`, "success");
       navigate(next);
     } catch (error) {
+      const details = error.payload || {};
+      if (details.verification_required) {
+        rememberVerification({ email: "", hint: details.email || "", next });
+        const params = new URLSearchParams({ next });
+        if (details.email) params.set("hint", details.email);
+        navigate(`/verify?${params.toString()}`);
+        return;
+      }
       showError(errorBox, error.message);
       submit.disabled = false;
       submit.textContent = initialLabel;
@@ -144,6 +163,7 @@ function registerForm() {
         <label class="label" for="register-email">Email</label>
         <input class="input" id="register-email" name="email" type="email" autocomplete="email"
                placeholder="you@example.com" required>
+        <span class="hint">После регистрации отправим 6-значный код подтверждения</span>
       </div>
       <div class="field">
         <label class="label" for="register-password">Пароль</label>

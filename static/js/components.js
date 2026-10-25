@@ -36,13 +36,17 @@ export function itemCard(item) {
     ? `<button class="card-play" data-play="${item.id}" aria-label="Слушать ${escapeAttr(item.title)}">${icon("play")}</button>`
     : `<button class="card-play" data-download="${item.id}" aria-label="Скачать ${escapeAttr(item.title)}">${icon("download")}</button>`;
 
+  const accessBadge = item.access === "paid"
+    ? `<span class="card-format card-format--paid">Платное</span>`
+    : `<span class="card-format">${escapeHtml(format)}</span>`;
+
   return `
     <article class="item-card" data-item-id="${item.id}">
       <div class="card-cover">
         <a class="cover-link" href="#/item/${item.id}" aria-label="Открыть ${escapeAttr(item.title)}"></a>
         <img src="${escapeAttr(item.cover_url)}" alt="Обложка ${escapeAttr(item.title)}" loading="lazy" decoding="async">
         ${categoryBadge(item.category, "card-badge")}
-        <span class="card-format">${escapeHtml(format)}</span>
+        ${accessBadge}
         ${action}
         ${isMusic && item.duration ? `<span class="card-duration">${formatDuration(item.duration)}</span>` : ""}
       </div>

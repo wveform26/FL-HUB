@@ -87,8 +87,39 @@ export function renderUpload(main) {
             </div>
           </div>
 
+      <div class="form-section">
+          <div class="form-section-title">Доступ</div>
+          <div class="access-picker" data-access-picker>
+            <label class="access-option is-active" data-access-option="free">
+              <input type="radio" name="access" value="free" checked>
+              <span class="access-option-inner">
+                <span class="access-icon">${icon("unlock")}</span>
+                <span class="access-label">Общий</span>
+                <span class="access-desc">Все могут слушать и скачивать</span>
+              </span>
+            </label>
+            <label class="access-option" data-access-option="paid">
+              <input type="radio" name="access" value="paid">
+              <span class="access-option-inner">
+                <span class="access-icon">${icon("lock")}</span>
+                <span class="access-label">Платный</span>
+                <span class="access-desc">Демо для всех, полный файл — для скачивания</span>
+              </span>
+            </label>
+          </div>
+          <div class="demo-upload hidden" data-demo-upload>
+            <label class="dropzone" data-demo-dropzone>
+              <input type="file" name="demo" accept=".wav,.mp3,.ogg,.flac,.m4a,.zip,.rar,.7z,.fpx" data-demo-input>
+              <span class="dropzone-icon" data-demo-dropzone-icon>${icon("disc")}</span>
+              <span class="dropzone-title" data-demo-dropzone-title>Перетащи демо-файл или <span>выбери файл</span></span>
+              <span class="dropzone-hint" data-demo-dropzone-hint>WAV, MP3, OGG, FLAC, M4A, ZIP, RAR, 7Z · до 180 МБ</span>
+            </label>
+            <div class="file-meta hidden" data-demo-file-meta style="margin-top:10px"></div>
+            <p class="hint" style="margin-top:8px">Демо-версия будет доступна для прослушивания всем. Полный файл — только для скачивания владельцем.</p>
+          </div>
+        </div>
           <div class="form-section">
-            <div class="form-section-title">Файлы</div>
+          <div class="form-section-title">Файлы</div>
             <label class="dropzone" data-dropzone>
               <input type="file" name="file" accept="${CATEGORIES.music.accept}" data-file-input required>
               <span class="dropzone-icon" data-dropzone-icon>${icon("upload")}</span>
@@ -133,6 +164,10 @@ export function renderUpload(main) {
           <div class="tip-item">
             <span class="tip-icon">${icon("piano")}</span>
             <div class="tip-text"><strong>BPM и тональность</strong>Укажи их для музыкальных работ — по ним проще находить нужное.</div>
+          </div>
+          <div class="tip-item">
+            <span class="tip-icon">${icon("lock")}</span>
+            <div class="tip-text"><strong>Платный доступ</strong>Укажи «Платный» и прикрепи демо-версию. Полный файл доступен только для скачивания.</div>
           </div>
           <div class="tip-item">
             <span class="tip-icon">${icon("shield")}</span>
@@ -180,6 +215,70 @@ export function renderUpload(main) {
   form.querySelectorAll("input[name='category']").forEach((radio) => {
     radio.addEventListener("change", updateCategory);
   });
+
+  // Access type switching
+  const accessOptions = form.querySelectorAll("[data-access-option]");
+  const demoUpload = form.querySelector("[data-demo-upload]");
+  const demoInput = form.querySelector("[data-demo-input]");
+  const demoDropzone = form.querySelector("[data-demo-dropzone]");
+  const demoDropzoneTitle = form.querySelector("[data-demo-dropzone-title]");
+  const demoDropzoneHint = form.querySelector("[data-demo-dropzone-hint]");
+  const demoFileMeta = form.querySelector("[data-demo-file-meta]");
+
+  accessOptions.forEach((option) => {
+    option.addEventListener("click", () => {
+      accessOptions.forEach((o) => o.classList.toggle("is-active", o === option));
+      demoUpload.classList.toggle("hidden", option.dataset.accessOption !== "paid");
+    });
+  });
+
+  function updateDemoMeta() {
+    const file = demoInput.files?.[0];
+    if (!file) {
+      demoDropzone.classList.remove("has-file");
+      demoFileMeta.classList.add("hidden");
+      demoFileMeta.innerHTML = "";
+      return;
+    }
+    demoDropzone.classList.add("has-file");
+    demoDropzoneTitle.innerHTML = escapeHtml(file.name);
+    demoDropzoneHint.textContent = `${formatBytes(file.size)} · готов к загрузке`;
+    demoFileMeta.classList.remove("hidden");
+    demoFileMeta.innerHTML = `
+      <span>${icon("disc")}</span>
+      <strong>${escapeHtml(file.name)}</strong>
+      <span class="dim">${formatBytes(file.size)}</span>
+      <button type="button" class="clear-file" data-clear-demo aria-label="Убрать демо">${icon("close")}</button>
+    `;
+    demoFileMeta.querySelector("[data-clear-demo]").addEventListener("click", () => {
+      demoInput.value = "";
+      updateDemoMeta();
+    });
+  }
+
+  demoInput?.addEventListener("change", updateDemoMeta);
+
+  if (demoDropzone) {
+    ["dragenter", "dragover"].forEach((eventName) => {
+      demoDropzone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        demoDropzone.classList.add("is-dragover");
+      });
+    });
+    ["dragleave", "dragend"].forEach((eventName) => {
+      demoDropzone.addEventListener(eventName, () => demoDropzone.classList.remove("is-dragover"));
+    });
+    demoDropzone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      demoDropzone.classList.remove("is-dragover");
+      const file = event.dataTransfer?.files?.[0];
+      if (!file) return;
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      demoInput.files = transfer.files;
+      updateDemoMeta();
+    });
+  }
 
   function updateFileMeta() {
     const file = fileInput.files?.[0];
@@ -253,6 +352,12 @@ export function renderUpload(main) {
     if (!fileInput.files?.length) {
       showError("Прикрепи файл работы.");
       dropzone.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
+    const accessType = form.querySelector("input[name='access']:checked")?.value || "free";
+    if (accessType === "paid" && !demoInput.files?.length) {
+      showError("Для платного контента прикрепи демо-версию.");
+      demoDropzone?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
     }
     const formData = new FormData(form);

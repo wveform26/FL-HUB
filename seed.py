@@ -418,9 +418,9 @@ def seed(force: bool = False) -> None:
             conn.execute("DELETE FROM items")
             conn.execute("DELETE FROM sessions")
             conn.execute("DELETE FROM users")
-            conn.execute(
-                "DELETE FROM sqlite_sequence WHERE name IN ('users', 'items', 'comments')"
-            )
+            conn.execute("ALTER SEQUENCE users_id_seq RESTART WITH 1")
+            conn.execute("ALTER SEQUENCE items_id_seq RESTART WITH 1")
+            conn.execute("ALTER SEQUENCE comments_id_seq RESTART WITH 1")
             conn.commit()
             for folder in (db.UPLOAD_DIR, db.COVER_DIR):
                 for path in folder.iterdir():
@@ -511,7 +511,7 @@ def seed(force: bool = False) -> None:
             item_ids[slug] = cursor.lastrowid
             for username in spec.get("likes", []):
                 conn.execute(
-                    "INSERT OR IGNORE INTO likes (item_id, user_id, created_at) VALUES (?, ?, ?)",
+                    "INSERT INTO likes (item_id, user_id, created_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
                     (item_ids[slug], user_ids[username], _iso(spec["days"] - 0.2)),
                 )
         for slug, username, body, days in COMMENTS:
@@ -532,7 +532,7 @@ def lock_demo_accounts() -> int:
     conn = db.connect()
     try:
         rows = conn.execute(
-            "SELECT id FROM users WHERE email LIKE '%@flhub.local' COLLATE NOCASE"
+            "SELECT id FROM users WHERE LOWER(email) LIKE '%@flhub.local'"
         ).fetchall()
         for row in rows:
             conn.execute(
@@ -543,6 +543,44 @@ def lock_demo_accounts() -> int:
         conn.commit()
         print(f"FL HUB: пароли демо-аккаунтов обновлены ({len(rows)}).")
         return len(rows)
+    finally:
+        conn.close()
+
+
+def remove_demo_accounts() -> tuple[int, int]:
+    """Удаляет демо-аккаунты (@flhub.local) вместе с их работами и файлами."""
+    db.init_db()
+    conn = db.connect()
+    try:
+        users = conn.execute(
+            "SELECT id FROM users WHERE LOWER(email) LIKE '%@flhub.local'"
+        ).fetchall()
+        user_ids = [row["id"] for row in users]
+        if not user_ids:
+            print("FL HUB: демо-аккаунтов нет.")
+            return 0, 0
+        marks = ",".join("?" * len(user_ids))
+        items = conn.execute(
+            f"SELECT id, file_path, audio_path, cover_path FROM items "
+            f"WHERE author_id IN ({marks})",
+            user_ids,
+        ).fetchall()
+        files = [
+            (db.UPLOAD_DIR, row["file_path"]) for row in items
+        ] + [
+            (db.UPLOAD_DIR, row["audio_path"]) for row in items
+        ] + [
+            (db.COVER_DIR, row["cover_path"]) for row in items
+        ]
+        # Лайки, комментарии и сессии удаляются каскадом (foreign_keys = ON).
+        conn.execute(f"DELETE FROM items WHERE author_id IN ({marks})", user_ids)
+        conn.execute(f"DELETE FROM users WHERE id IN ({marks})", user_ids)
+        conn.commit()
+        for folder, name in files:
+            if name and Path(name).name == name:
+                (folder / name).unlink(missing_ok=True)
+        print(f"FL HUB: удалено демо-аккаунтов: {len(user_ids)}, работ: {len(items)}.")
+        return len(user_ids), len(items)
     finally:
         conn.close()
 

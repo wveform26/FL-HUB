@@ -59,6 +59,7 @@ export async function renderItem(main, ctx) {
   const meta = categoryMeta(item.category);
   const isMusic = item.category === "music";
   const isOwner = item.is_owner || state.user?.username === item.author.username;
+  const isPaid = item.access === "paid";
   const metaItems = [
     ["Жанр", item.genre || "—"],
     ["BPM", item.bpm || "—"],
@@ -86,8 +87,8 @@ export async function renderItem(main, ctx) {
             ${isMusic && item.duration ? `<span class="card-duration">${formatDuration(item.duration)}</span>` : ""}
           </div>
           <div class="item-actions">
-            ${item.audio_url
-              ? `<button class="play-big" data-play="${item.id}" data-play-label>${icon("play")}<span>Слушать</span></button>`
+            ${isMusic || item.audio_url
+              ? `<button class="play-big" data-play="${item.id}" data-play-label>${icon(isPaid && !isOwner ? "disc" : "play")}<span>${isPaid && !isOwner ? "Слушать демо" : "Слушать"}</span></button>`
               : `<a class="play-big" href="/download/${item.id}" data-download="${item.id}">${icon("download")}<span>Скачать</span></a>`}
             <button class="icon-btn ${item.liked ? "is-liked" : ""}" data-like="${item.id}"
                     data-liked="${item.liked ? 1 : 0}" data-count="${item.likes}"
@@ -113,7 +114,8 @@ export async function renderItem(main, ctx) {
 
         <div class="item-info">
           <div class="item-category">
-            <span class="cat-label" style="color:${meta.color}">${icon(meta.icon)} ${escapeHtml(meta.label)}</span>
+            <span class="cat-label" style="--cat:${meta.color}">${icon(meta.icon)} ${escapeHtml(meta.label)}</span>
+            ${isPaid ? `<span class="pill pill--paid">${icon("lock")} Платный доступ</span>` : ""}
             <span class="pill"><span class="dot"></span> ${timeAgo(item.created_at)}</span>
           </div>
           <h1 class="item-title">${escapeHtml(item.title)}</h1>

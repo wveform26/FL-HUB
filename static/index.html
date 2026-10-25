@@ -10,6 +10,22 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Unbounded:wght@500;600;700&display=swap" rel="stylesheet">
+  <script>
+    // Тема применяется до первой отрисовки, чтобы не было вспышки тёмного фона.
+    (function () {
+      var preference = "auto";
+      try { preference = localStorage.getItem("flhub-theme") || "auto"; } catch (error) {}
+      var wantsLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+      var theme = preference === "light" || preference === "dark"
+        ? preference
+        : (wantsLight ? "light" : "dark");
+      document.documentElement.dataset.theme = theme;
+      document.documentElement.style.colorScheme = theme;
+      if (theme === "light") {
+        document.querySelector('meta[name="theme-color"]').setAttribute("content", "#f4f3f7");
+      }
+    })();
+  </script>
   <link rel="stylesheet" href="/static/css/style.css">
   <script type="module" src="/static/js/app.js"></script>
 </head>

@@ -11,6 +11,7 @@ import {
   state,
 } from "./store.js";
 import { closeModal, emptyState, toast } from "./ui.js";
+import { initTheme, syncThemeButtons, themeSwitchHtml } from "./theme.js";
 import { escapeAttr, escapeHtml, formatCount } from "./utils.js";
 import { renderHome } from "./views/home.js";
 import { renderCatalog } from "./views/catalog.js";
@@ -18,6 +19,7 @@ import { renderItem } from "./views/item.js";
 import { renderUpload } from "./views/upload.js";
 import { renderProfile } from "./views/profile.js";
 import { renderAuth } from "./views/auth.js";
+import { renderVerify } from "./views/verify.js";
 
 const NAV_ITEMS = [
   { key: "catalog", label: "Каталог", href: "#/catalog" },
@@ -34,6 +36,7 @@ const ROUTES = [
   { pattern: /^\/profile\/([A-Za-z0-9_]+)$/, render: renderProfile, title: "Профиль — FL HUB", param: "username" },
   { pattern: /^\/login$/, render: renderAuth, title: "Вход — FL HUB" },
   { pattern: /^\/register$/, render: renderAuth, title: "Регистрация — FL HUB" },
+  { pattern: /^\/verify$/, render: renderVerify, title: "Подтверждение email — FL HUB" },
 ];
 
 const main = document.getElementById("main");
@@ -104,6 +107,7 @@ function renderHeader(path = "/", params = new URLSearchParams()) {
         </form>
       </div>
       <div class="header-actions">
+        ${themeSwitchHtml()}
         <a class="btn btn-primary btn-sm btn-upload" href="#/upload">
           ${icon("upload")}<span class="btn-upload-label">Загрузить</span>
         </a>
@@ -135,12 +139,14 @@ function renderHeader(path = "/", params = new URLSearchParams()) {
         <input type="search" name="q" value="${escapeAttr(searchValue)}" placeholder="Поиск по каталогу" aria-label="Поиск по каталогу" autocomplete="off">
       </form>
       ${mobileNav}
+      <div class="theme-row">Тема оформления ${themeSwitchHtml()}</div>
       ${user
         ? `<a class="nav-link" href="#/profile/${encodeURIComponent(user.username)}">Мой профиль</a>
            <button class="nav-link" type="button" data-logout>Выйти</button>`
         : `<a class="nav-link" href="#/login">Войти в аккаунт</a>`}
     </div>
   `;
+  syncThemeButtons();
 }
 
 function renderFooter() {
@@ -182,7 +188,7 @@ function renderFooter() {
       </div>
       <div class="footer-bottom">
         <span>© ${year} FL HUB. Сделано для продюсеров.</span>
-        <span>Python + SQLite · без внешних зависимостей</span>
+        <span>Python + PostgreSQL</span>
       </div>
     </div>
   `;
@@ -429,6 +435,7 @@ function setupEvents() {
 }
 
 async function init() {
+  initTheme();
   renderFooter();
   initPlayer();
   renderHeader();

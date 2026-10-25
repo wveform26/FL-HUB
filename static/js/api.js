@@ -17,7 +17,9 @@ async function parseResponse(response) {
     }
   }
   if (!response.ok) {
-    throw new ApiError(data.error || `Ошибка запроса (${response.status})`, response.status);
+    const error = new ApiError(data.error || `Ошибка запроса (${response.status})`, response.status);
+    error.payload = data;
+    throw error;
   }
   return data;
 }
